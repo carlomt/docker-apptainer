@@ -1,9 +1,7 @@
 name: Docker Build Deploy
 
 on:
-  pull_request:
   push:
-    branches: [ "main" ]
     tags:
       - "v*"
 
