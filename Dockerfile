@@ -1,33 +1,112 @@
-FROM debian:bookworm-slim as common
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+
+FROM ${DEBIAN_IMAGE} AS builder
+
 LABEL maintainer="carlo.mancini-terracciano@uniroma1.it"
 
 ARG APPTAINER_VERSION
-
-#labels
-LABEL org.label-schema.apptainer-version=$APPTAINER_VERSION
-LABEL org.label-schema.build-date=$BUILD_DATE
-LABEL org.label-schema.name="carlomt/geant4"
-LABEL org.label-schema.description="Geant4 Docker image"
-LABEL org.label-schema.url="https://github.com/carlomt/docker-geant4"
-LABEL org.label-schema.docker.cmd="docker build -t carlomt/apptainer:latest --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') --no-cache=true ."
+ARG BUILD_DATE
+ARG TARGETARCH
+ARG DEBIAN_IMAGE
 
 ENV LANG=C.UTF-8
+ENV PATH="/usr/local/go/bin:${PATH}"
+
 RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 
 RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get update && \
     apt-get -yq --no-install-recommends install \
-    ca-certificates \
-    wget \
+      ca-certificates \
+      curl \
+      git \
+      build-essential \
+      pkg-config \
+      squashfs-tools \
+      cryptsetup-bin \
+      uidmap \
+      libseccomp-dev \
+      libglib2.0-dev \
+      libfuse3-dev \
+      libssl-dev \
+      uuid-dev \
+      libgpgme-dev \
+      libassuan-dev \
+      libdevmapper-dev \
+      wget \
     && \
-    cd /tmp && \
-    wget https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb && \
-    apt install -y ./apptainer_${APPTAINER_VERSION}_amd64.deb \
+    rm -rf /var/lib/apt/lists/*
+
+RUN test -n "${APPTAINER_VERSION}" || (echo "ERROR: APPTAINER_VERSION is not set" >&2; exit 1) && \
+    test -n "${TARGETARCH}" || (echo "ERROR: TARGETARCH is not set" >&2; exit 1) && \
+    case "${TARGETARCH}" in \
+      amd64) GO_ARCH="amd64" ;; \
+      arm64) GO_ARCH="arm64" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    GO_VERSION="1.23.5" && \
+    curl -fsSL \
+      "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" \
+      --output /tmp/go.tar.gz && \
+    tar -C /usr/local -xzf /tmp/go.tar.gz && \
+    rm -f /tmp/go.tar.gz && \
+    go version
+
+RUN curl -fsSL \
+      "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer-${APPTAINER_VERSION}.tar.gz" \
+      --output /tmp/apptainer.tar.gz && \
+    mkdir -p /tmp/apptainer && \
+    tar -xzf /tmp/apptainer.tar.gz -C /tmp/apptainer --strip-components=1 && \
+    cd /tmp/apptainer && \
+    ./mconfig --prefix=/usr/local && \
+    make -C builddir && \
+    make -C builddir install
+
+#######################################################################
+
+FROM ${DEBIAN_IMAGE}
+
+LABEL maintainer="carlo.mancini-terracciano@uniroma1.it"
+
+ARG APPTAINER_VERSION
+ARG BUILD_DATE
+ARG DEBIAN_IMAGE
+
+LABEL org.label-schema.apptainer-version="${APPTAINER_VERSION}"
+LABEL org.label-schema.build-date="${BUILD_DATE}"
+LABEL org.label-schema.name="carlomt/apptainer"
+LABEL org.label-schema.description="Apptainer Docker image"
+LABEL org.label-schema.url="https://github.com/carlomt/apptainer"
+LABEL org.label-schema.base-image="${DEBIAN_IMAGE}"
+LABEL org.label-schema.docker.cmd="docker build -t carlomt/apptainer:latest ."
+
+ENV LANG=C.UTF-8
+
+RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get -yq --no-install-recommends install \
+      ca-certificates \
+      squashfs-tools \
+      cryptsetup-bin \
+      uidmap \
+      fuse3 \
+      libseccomp2 \
+      libglib2.0-0 \
+      libfuse3-3 \
+      libssl3 \
+      libgpgme11 \
+      libassuan0 \
+      libdevmapper1.02.1 \
     && \
     apt-get -y autoremove && \
     apt-get -y clean && \
     rm -rf /var/cache/apt/archives/* && \
     rm -rf /var/lib/apt/lists/*
 
-# Default command to execute if none is provided to docker run
+COPY --from=builder /usr/local/ /usr/local/
+
+RUN apptainer --version
+
 CMD ["bash"]
