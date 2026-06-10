@@ -3,30 +3,244 @@ name: Docker Build Deploy
 on:
   pull_request:
   push:
-    branches: main
+    branches: [ "main" ]
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DEFAULT_APPTAINER_VERSION: "1.3.2"
+  DOCKERHUB_IMAGE: carlomt/apptainer
 
 jobs:
-  build-test-container:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+  docker_build:
+    name: Build Apptainer Docker image ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
 
-    container:
-        image: docker/docker
-        options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
-    name: Build Container
     steps:
+      - name: Check out code
+        uses: actions/checkout@v5
 
-      - name: Check out code for the container builds
-        uses: actions/checkout@v4
-
-      - name: Build Container
+      - name: Set build variables
+        shell: bash
         run: |
-           docker build --build-arg APPTAINER_VERSION=1.3.2 -t apptainer .
+          set -euo pipefail
 
-      - name: Login and Deploy Container
+          repo_lower="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_IMAGE=ghcr.io/${repo_lower}" >> "$GITHUB_ENV"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            APPTAINER_VERSION="${GITHUB_REF_NAME#v}"
+
+            if [[ -z "${APPTAINER_VERSION}" || "${APPTAINER_VERSION}" == "${GITHUB_REF_NAME}" ]]; then
+              echo "This workflow expects tags like v1.3.2" >&2
+              exit 1
+            fi
+
+            echo "APPTAINER_VERSION=${APPTAINER_VERSION}" >> "$GITHUB_ENV"
+            echo "PUBLISH=true" >> "$GITHUB_ENV"
+          else
+            echo "APPTAINER_VERSION=${DEFAULT_APPTAINER_VERSION}" >> "$GITHUB_ENV"
+            echo "PUBLISH=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image for PR and branch push
+        if: env.PUBLISH != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            APPTAINER_VERSION=${{ env.APPTAINER_VERSION }}
+          cache-from: type=gha,scope=apptainer-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=apptainer-${{ matrix.arch }}
+
+      - name: Build and push GHCR image by digest
+        if: env.PUBLISH == 'true'
+        id: build_ghcr
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            APPTAINER_VERSION=${{ env.APPTAINER_VERSION }}
+          cache-from: type=gha,scope=apptainer-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=apptainer-${{ matrix.arch }}
+
+      - name: Build and push Docker Hub image by digest
+        if: env.PUBLISH == 'true'
+        id: build_dockerhub
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.DOCKERHUB_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            APPTAINER_VERSION=${{ env.APPTAINER_VERSION }}
+          cache-from: type=gha,scope=apptainer-${{ matrix.arch }}
+
+      - name: Export GHCR digest
+        if: env.PUBLISH == 'true'
+        shell: bash
         run: |
-           echo ${{ secrets.GITHUB_TOKEN }} | singularity remote login -u ${{ secrets.GHCR_USERNAME }} --password-stdin oras://ghcr.io
-           docker push oras://ghcr.io/${GITHUB_REPOSITORY}:${tag}
+          set -euo pipefail
+          mkdir -p /tmp/digests/ghcr
+          digest="${{ steps.build_ghcr.outputs.digest }}"
+          touch "/tmp/digests/ghcr/${digest#sha256:}"
+
+      - name: Export Docker Hub digest
+        if: env.PUBLISH == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests/dockerhub
+          digest="${{ steps.build_dockerhub.outputs.digest }}"
+          touch "/tmp/digests/dockerhub/${digest#sha256:}"
+
+      - name: Upload GHCR digest artifact
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-ghcr-${{ matrix.arch }}
+          path: /tmp/digests/ghcr/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Docker Hub digest artifact
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-dockerhub-${{ matrix.arch }}
+          path: /tmp/digests/dockerhub/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker_manifest:
+    name: Create multiarch manifests
+    needs: docker_build
+    runs-on: ubuntu-24.04
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Set manifest variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo_lower="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "GHCR_IMAGE=ghcr.io/${repo_lower}" >> "$GITHUB_ENV"
+          echo "APPTAINER_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Download GHCR digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests/ghcr
+          pattern: digests-ghcr-*
+          merge-multiple: true
+
+      - name: Download Docker Hub digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests/dockerhub
+          pattern: digests-dockerhub-*
+          merge-multiple: true
+
+      - name: Create and push GHCR multiarch manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          refs=()
+          for digest_file in /tmp/digests/ghcr/*; do
+            [ -e "$digest_file" ] || continue
+            digest="$(basename "$digest_file")"
+            refs+=("${GHCR_IMAGE}@sha256:${digest}")
+          done
+
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo "No GHCR digests found" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            -t "${GHCR_IMAGE}:${APPTAINER_VERSION}" \
+            -t "${GHCR_IMAGE}:latest" \
+            "${refs[@]}"
+
+      - name: Create and push Docker Hub multiarch manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          refs=()
+          for digest_file in /tmp/digests/dockerhub/*; do
+            [ -e "$digest_file" ] || continue
+            digest="$(basename "$digest_file")"
+            refs+=("${DOCKERHUB_IMAGE}@sha256:${digest}")
+          done
+
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo "No Docker Hub digests found" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            -t "${DOCKERHUB_IMAGE}:${APPTAINER_VERSION}" \
+            -t "${DOCKERHUB_IMAGE}:latest" \
+            "${refs[@]}"
+
+      - name: Inspect GHCR image
+        run: |
+          docker buildx imagetools inspect "${GHCR_IMAGE}:${APPTAINER_VERSION}"
+
+      - name: Inspect Docker Hub image
+        run: |
+          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${APPTAINER_VERSION}"
