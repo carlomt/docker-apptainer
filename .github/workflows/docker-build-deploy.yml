@@ -10,13 +10,15 @@ permissions:
   packages: write
 
 env:
-  DEFAULT_APPTAINER_VERSION: "1.3.2"
   DOCKERHUB_IMAGE: carlomt/apptainer
+  DEBIAN_IMAGE: debian:bookworm-slim
+  GO_VERSION: "1.23.5"
 
 jobs:
   docker_build:
     name: Build Apptainer Docker image ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
 
     strategy:
       fail-fast: false
@@ -36,29 +38,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          repo_lower="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
-          echo "GHCR_IMAGE=ghcr.io/${repo_lower}" >> "$GITHUB_ENV"
+          APPTAINER_VERSION="${GITHUB_REF_NAME#v}"
 
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            APPTAINER_VERSION="${GITHUB_REF_NAME#v}"
-
-            if [[ -z "${APPTAINER_VERSION}" || "${APPTAINER_VERSION}" == "${GITHUB_REF_NAME}" ]]; then
-              echo "This workflow expects tags like v1.3.2" >&2
-              exit 1
-            fi
-
-            echo "APPTAINER_VERSION=${APPTAINER_VERSION}" >> "$GITHUB_ENV"
-            echo "PUBLISH=true" >> "$GITHUB_ENV"
-          else
-            echo "APPTAINER_VERSION=${DEFAULT_APPTAINER_VERSION}" >> "$GITHUB_ENV"
-            echo "PUBLISH=false" >> "$GITHUB_ENV"
+          if [[ -z "${APPTAINER_VERSION}" || "${APPTAINER_VERSION}" == "${GITHUB_REF_NAME}" ]]; then
+            echo "This workflow expects tags like v1.5.1" >&2
+            exit 1
           fi
+
+          repo_lower="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          echo "APPTAINER_VERSION=${APPTAINER_VERSION}" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+          echo "GHCR_IMAGE=ghcr.io/${repo_lower}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
-        if: env.PUBLISH == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -66,25 +62,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        if: env.PUBLISH == 'true'
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build image for PR and branch push
-        if: env.PUBLISH != 'true'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/${{ matrix.arch }}
-          build-args: |
-            APPTAINER_VERSION=${{ env.APPTAINER_VERSION }}
-          cache-from: type=gha,scope=apptainer-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=apptainer-${{ matrix.arch }}
-
       - name: Build and push GHCR image by digest
-        if: env.PUBLISH == 'true'
         id: build_ghcr
         uses: docker/build-push-action@v7
         with:
@@ -93,11 +76,14 @@ jobs:
           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             APPTAINER_VERSION=${{ env.APPTAINER_VERSION }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+            TARGETARCH=${{ matrix.arch }}
+            DEBIAN_IMAGE=${{ env.DEBIAN_IMAGE }}
+            GO_VERSION=${{ env.GO_VERSION }}
           cache-from: type=gha,scope=apptainer-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=apptainer-${{ matrix.arch }}
 
       - name: Build and push Docker Hub image by digest
-        if: env.PUBLISH == 'true'
         id: build_dockerhub
         uses: docker/build-push-action@v7
         with:
@@ -106,10 +92,14 @@ jobs:
           outputs: type=image,name=${{ env.DOCKERHUB_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             APPTAINER_VERSION=${{ env.APPTAINER_VERSION }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+            TARGETARCH=${{ matrix.arch }}
+            DEBIAN_IMAGE=${{ env.DEBIAN_IMAGE }}
+            GO_VERSION=${{ env.GO_VERSION }}
           cache-from: type=gha,scope=apptainer-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=apptainer-dockerhub-${{ matrix.arch }}
 
       - name: Export GHCR digest
-        if: env.PUBLISH == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -118,7 +108,6 @@ jobs:
           touch "/tmp/digests/ghcr/${digest#sha256:}"
 
       - name: Export Docker Hub digest
-        if: env.PUBLISH == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -127,7 +116,6 @@ jobs:
           touch "/tmp/digests/dockerhub/${digest#sha256:}"
 
       - name: Upload GHCR digest artifact
-        if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: digests-ghcr-${{ matrix.arch }}
@@ -136,7 +124,6 @@ jobs:
           retention-days: 1
 
       - name: Upload Docker Hub digest artifact
-        if: env.PUBLISH == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: digests-dockerhub-${{ matrix.arch }}
@@ -148,8 +135,7 @@ jobs:
     name: Create multiarch manifests
     needs: docker_build
     runs-on: ubuntu-24.04
-
-    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 30
 
     steps:
       - name: Set manifest variables
@@ -158,6 +144,7 @@ jobs:
           set -euo pipefail
 
           repo_lower="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
           echo "GHCR_IMAGE=ghcr.io/${repo_lower}" >> "$GITHUB_ENV"
           echo "APPTAINER_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
